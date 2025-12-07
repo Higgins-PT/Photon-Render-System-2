@@ -6,6 +6,14 @@ A high-performance ray-traced global illumination system for Unity Universal Ren
 
 Photon Render System 2 is a comprehensive ray tracing solution that provides real-time global illumination, reflections, and advanced lighting features. Built on Unity's Universal Render Pipeline, it leverages modern GPU ray tracing capabilities to deliver photorealistic rendering.
 
+## Showcase
+<img width="2210" height="1224" alt="92b49b680e7724c588dbe23e35ac2949 - 副本" src="https://github.com/user-attachments/assets/bb9a1b5d-6aa6-4bf5-b591-b19ed0bf794f" />
+<img width="2204" height="1233" alt="c61ef9c68d764163cd6be768beef4ad6 - 副本" src="https://github.com/user-attachments/assets/ef160377-72fc-4af9-b8c3-8fcd2f2e4ed2" />
+<img width="2195" height="1229" alt="5b0a4405-e6da-4132-b03f-90a389d7faa6" src="https://github.com/user-attachments/assets/2d901ecd-f37a-45ae-abb6-8b9d19fbfde0" />
+<img width="2179" height="1211" alt="3fb3eea9e38be5648d8d13b879538579" src="https://github.com/user-attachments/assets/845c9696-3d11-4255-bca1-7d426cdc76cc" />
+<img width="2184" height="1201" alt="0f714abd-ad08-4899-b730-56189a73080e" src="https://github.com/user-attachments/assets/9e3050b4-e584-4c00-bb0d-c77100ca4a22" />
+<img width="2184" height="1215" alt="2dbadc86-16e0-486f-830a-bcb133870f55" src="https://github.com/user-attachments/assets/d162c06e-a654-4e98-b55d-1996a88507ab" />
+
 ## Features
 
 ### Core Rendering
