@@ -1,0 +1,210 @@
+#include "UnityShaderVariables.cginc"
+#include "RayPayload.hlsl"
+#include "ReSTIRCommon.hlsl"
+#include "PhotonGeometry.hlsl"
+#include "BRDF.hlsl"
+#pragma max_recursion_depth 1
+
+RaytracingAccelerationStructure g_SceneAccelStruct;
+
+RWStructuredBuffer<RayPayload> g_PrimaryRayPayloads;
+RWTexture2D<float4> g_SpecularAccumOutput;
+RWTexture2D<float4> g_DiffuseAlbedoOutput;
+RWTexture2D<float4> g_SpecularAlbedoOutput;
+RWTexture2D<float>  g_RoughnessOutput;
+
+TextureCube<float4> g_EnvironmentMap;
+SamplerState samplerg_EnvironmentMap;
+
+cbuffer PrimaryRaySettings
+{
+    float g_Zoom;
+    int   g_MaxBounces;
+    int   g_MaxIterations;
+    uint  g_FrameIndex;
+    float g_Time;
+    float g_SettingsPadding;
+};
+
+float g_CameraNearPlane;
+float g_CameraFarPlane;
+
+float GetCameraNearPlaneSafe()
+{
+    return max(1.0e-4f, g_CameraNearPlane);
+}
+
+float GetCameraFarPlaneSafe()
+{
+    float nearPlane = GetCameraNearPlaneSafe();
+    return max(nearPlane + 1.0e-3f, g_CameraFarPlane);
+}
+struct MinimalPayload
+{
+    float3 baseColor;
+    float3 emission;
+    float3 throughput;
+    float3 hitPosition;
+    float3 hitNormal;
+    float3 rayDir;
+    float3 specularColor;
+    float  metallic;
+    float  smoothness;
+    float  anisotropy;
+    float  transparency;
+    float  ior;
+    int    hit;
+    int    mainLight;
+    int    remainingDepth;
+};
+
+[shader("miss")]
+void PrimaryMiss(inout MinimalPayload payload : SV_RayPayload)
+{
+    float3 dir = normalize(payload.rayDir);
+    float3 envColor = g_EnvironmentMap.SampleLevel(samplerg_EnvironmentMap, dir, 0).rgb;
+    payload.baseColor = envColor;
+    payload.emission = 0;
+    payload.hitPosition = 0;
+    payload.hitNormal = float3(0, 1, 0);
+    payload.hit = 0;
+    payload.throughput = 0;
+    payload.metallic = 0;
+    payload.smoothness = 0;
+    payload.anisotropy = 0;
+    payload.transparency = 0;
+    payload.ior = 1.0f;
+    payload.specularColor = float3(1, 1, 1);
+    payload.mainLight = 1;
+    payload.remainingDepth = 0;
+}
+
+[shader("raygeneration")]
+void MainRayGenShader()
+{
+    uint2 index = DispatchRaysIndex().xy;
+    uint2 dim   = DispatchRaysDimensions().xy;
+
+    float2 pixel = float2(index.x, index.y) + float2(0.5, 0.5);
+
+    float2 ndc = pixel / float2(dim.x - 1, dim.y - 1);
+    ndc = ndc * 2.0 - 1.0;
+
+    ndc *= g_Zoom;
+    float aspect = (float)dim.x / (float)dim.y;
+
+    float3 viewDir = normalize(float3(ndc.x * aspect, ndc.y, 1.0));
+
+    float3 worldDir = normalize(mul((float3x3)unity_CameraToWorld, viewDir));
+
+    RayDesc ray;
+    ray.Origin    = _WorldSpaceCameraPos;
+    ray.Direction = worldDir;
+    ray.TMin      = GetCameraNearPlaneSafe();
+    ray.TMax      = GetCameraFarPlaneSafe();
+
+    MinimalPayload payload;
+    payload.baseColor = float3(0, 0, 0);
+    payload.emission = float3(0, 0, 0);
+    payload.throughput = float3(1, 1, 1);
+    payload.hitPosition = ray.Origin;
+    payload.hitNormal = ray.Direction;
+    payload.rayDir = ray.Direction;
+    payload.metallic = 0;
+    payload.smoothness = 0;
+    payload.anisotropy = 0;
+    payload.transparency = 0;
+    payload.ior = 1.0f;
+    payload.hit = 0;
+    payload.mainLight = 1;
+    payload.remainingDepth = g_MaxBounces;
+    payload.specularColor = float3(1, 1, 1);
+
+    TraceRay(
+        g_SceneAccelStruct,
+        0,
+        0xFF,
+        0,
+        1,
+        0,
+        ray,
+        payload
+    );
+
+
+    int maxIterations = max(1, g_MaxIterations);
+    float3 specularAccum = float3(1, 1, 1);
+    for(int i = 0; i < maxIterations; i++)
+    {
+        bool nextRay = payload.hit && 
+        payload.metallic == 1 && 
+        payload.smoothness == 1 && 
+        ((payload.transparency <= 0.001f) || (payload.transparency >= 0.999f));
+
+        if(!nextRay)
+            break;
+
+        float3 normalDir = normalize(payload.hitNormal);
+        float3 incidentDir = normalize(payload.rayDir);
+
+        specularAccum *= payload.specularColor;
+
+        float cosTheta = dot(-normalDir, incidentDir);
+        bool entering = cosTheta > 0.0f;
+        bool performRefraction = payload.transparency >= 0.999f;
+        float materialIor = payload.ior > 0.0f ? payload.ior : 1.5f;
+        float3 newDir = reflect(incidentDir, normalDir);
+        float3 originOffset = entering ? normalDir : -normalDir;
+
+        if (performRefraction)
+        {
+
+            float eta = entering ? (1.0f / materialIor) : materialIor;
+            float3 refractNormal = entering ? normalDir : -normalDir;
+            float3 refractedDir = refract(incidentDir, refractNormal, eta);
+
+            newDir = normalize(refractedDir);
+            originOffset = -refractNormal;
+        }
+
+        ray.Origin = payload.hitPosition + originOffset * 0.01f;
+        ray.Direction = newDir;
+        payload.rayDir = ray.Direction;
+        TraceRay(
+            g_SceneAccelStruct,
+            0,
+            0xFF,
+            0,
+            1,
+            0,
+            ray,
+            payload
+        );
+    }
+    uint linearIndex = index.y * dim.x + index.x;
+    RayPayload outputPayload;
+    outputPayload.baseColor = payload.baseColor;
+    outputPayload.emission = payload.emission;
+    outputPayload.throughput = payload.throughput;
+    outputPayload.hitPosition = payload.hitPosition;
+    outputPayload.hitNormal = payload.hitNormal;
+    outputPayload.rayDir = payload.rayDir;
+    outputPayload.metallic = payload.metallic;
+    outputPayload.smoothness = payload.smoothness;
+    outputPayload.anisotropy = payload.anisotropy;
+    outputPayload.transparency = payload.transparency;
+    outputPayload.ior = payload.ior;
+    outputPayload.specularColor = payload.specularColor;
+    outputPayload.hit = payload.hit;
+    outputPayload.mainLight = payload.mainLight;
+    outputPayload.remainingDepth = payload.remainingDepth;
+
+    g_PrimaryRayPayloads[linearIndex] = outputPayload;
+    g_SpecularAccumOutput[int2(index.xy)] = float4(specularAccum, 1.0f);
+    g_DiffuseAlbedoOutput[int2(index.xy)] = float4(payload.baseColor, 1.0f);
+    g_SpecularAlbedoOutput[int2(index.xy)] = float4(payload.specularColor, 1.0f);
+    float roughnessValue = saturate(1.0f - payload.smoothness);
+    g_RoughnessOutput[int2(index.xy)] = roughnessValue;
+}
+
+

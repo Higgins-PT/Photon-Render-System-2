@@ -1,0 +1,53 @@
+#pragma kernel Composite
+
+float3 NormalizeSafe(float3 value, float3 fallback)
+{
+    float lenSq = dot(value, value);
+    if (lenSq <= 1.0e-6f)
+        return fallback;
+    return value * rsqrt(lenSq);
+}
+#include "RayPayload.hlsl"
+#include "BRDF.hlsl"
+
+Texture2D<float4> g_RadianceInput;
+Texture2D<float4> g_SpecularAccumInput;
+RWTexture2D<float4> g_FinalOutput;
+StructuredBuffer<RayPayload> g_PrimaryRayPayloads;
+
+cbuffer CompositeSettings
+{
+    uint g_ImageWidth;
+    uint g_ImageHeight;
+};
+
+[numthreads(8, 8, 1)]
+void Composite(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= g_ImageWidth || id.y >= g_ImageHeight)
+        return;
+
+    uint index = id.y * g_ImageWidth + id.x;
+    float3 radiance = g_RadianceInput[int2(id.xy)].rgb;
+    float3 specularAccum = g_SpecularAccumInput[int2(id.xy)].rgb;
+    RayPayload payload = g_PrimaryRayPayloads[index];
+
+    float3 baseColor = payload.baseColor;
+    float3 emission = payload.emission;
+    float3 finalColor;
+
+    if (payload.hit == 0)
+    {
+        float3 shaded = baseColor + emission;
+        finalColor = shaded * specularAccum;
+    }
+    else
+    {
+        float3 shaded = radiance + emission;
+        finalColor = shaded * specularAccum;
+    }
+
+    g_FinalOutput[int2(id.xy)] = float4(finalColor, 1.0f);
+}
+
+

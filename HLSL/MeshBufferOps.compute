@@ -1,0 +1,80 @@
+#pragma kernel CopyFloat3
+#pragma kernel CopyFloat2
+#pragma kernel CopyUInt3
+#pragma kernel ClearFloat3
+#pragma kernel ClearFloat2
+#pragma kernel ClearUInt3
+
+RWStructuredBuffer<float3> g_TargetFloat3;
+StructuredBuffer<float3> g_SourceFloat3;
+
+RWStructuredBuffer<float2> g_TargetFloat2;
+StructuredBuffer<float2> g_SourceFloat2;
+
+RWStructuredBuffer<uint3> g_TargetUInt3;
+StructuredBuffer<uint3> g_SourceUInt3;
+
+uint g_CopyCount;
+uint g_TargetOffset;
+uint g_SourceOffset;
+
+[numthreads(64, 1, 1)]
+void CopyFloat3(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    if (idx >= g_CopyCount)
+        return;
+
+    g_TargetFloat3[g_TargetOffset + idx] = g_SourceFloat3[g_SourceOffset + idx];
+}
+
+[numthreads(64, 1, 1)]
+void CopyFloat2(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    if (idx >= g_CopyCount)
+        return;
+
+    g_TargetFloat2[g_TargetOffset + idx] = g_SourceFloat2[g_SourceOffset + idx];
+}
+
+[numthreads(64, 1, 1)]
+void CopyUInt3(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    if (idx >= g_CopyCount)
+        return;
+
+    g_TargetUInt3[g_TargetOffset + idx] = g_SourceUInt3[g_SourceOffset + idx];
+}
+
+[numthreads(64, 1, 1)]
+void ClearFloat3(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    if (idx >= g_CopyCount)
+        return;
+
+    g_TargetFloat3[g_TargetOffset + idx] = 0;
+}
+
+[numthreads(64, 1, 1)]
+void ClearFloat2(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    if (idx >= g_CopyCount)
+        return;
+
+    g_TargetFloat2[g_TargetOffset + idx] = 0;
+}
+
+[numthreads(64, 1, 1)]
+void ClearUInt3(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    if (idx >= g_CopyCount)
+        return;
+
+    g_TargetUInt3[g_TargetOffset + idx] = 0;
+}
+

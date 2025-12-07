@@ -1,0 +1,120 @@
+#pragma kernel K_RTToBufferFloat1
+#pragma kernel K_RTToBufferFloat2
+#pragma kernel K_RTToBufferFloat3
+#pragma kernel K_RTToBufferFloat4
+#pragma kernel K_BufferToRTFloat1
+#pragma kernel K_BufferToRTFloat2
+#pragma kernel K_BufferToRTFloat3
+#pragma kernel K_BufferToRTFloat4
+
+RWStructuredBuffer<float>  _OutputBufferF1;
+RWStructuredBuffer<float2> _OutputBufferF2;
+RWStructuredBuffer<float3> _OutputBufferF3;
+RWStructuredBuffer<float4> _OutputBufferF4;
+
+StructuredBuffer<float>  _InputBufferF1;
+StructuredBuffer<float2> _InputBufferF2;
+StructuredBuffer<float3> _InputBufferF3;
+StructuredBuffer<float4> _InputBufferF4;
+
+Texture2D<float>  _InputTextureF1;
+Texture2D<float2> _InputTextureF2;
+Texture2D<float3> _InputTextureF3;
+Texture2D<float4> _InputTextureF4;
+
+RWTexture2D<float>  _OutputTextureF1;
+RWTexture2D<float2> _OutputTextureF2;
+RWTexture2D<float3> _OutputTextureF3;
+RWTexture2D<float4> _OutputTextureF4;
+
+int _Width;
+int _Height;
+
+[numthreads(8, 8, 1)]
+void K_RTToBufferFloat1(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _Width || id.y >= _Height)
+        return;
+
+    uint index = id.y * _Width + id.x;
+    float value = _InputTextureF1[int2(id.xy)];
+    _OutputBufferF1[index] = value;
+}
+
+[numthreads(8, 8, 1)]
+void K_RTToBufferFloat2(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _Width || id.y >= _Height)
+        return;
+
+    uint index = id.y * _Width + id.x;
+    float2 value = _InputTextureF2[int2(id.xy)];
+    _OutputBufferF2[index] = value;
+}
+
+[numthreads(8, 8, 1)]
+void K_RTToBufferFloat3(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _Width || id.y >= _Height)
+        return;
+
+    uint index = id.y * _Width + id.x;
+    float3 value = _InputTextureF3[int2(id.xy)];
+    _OutputBufferF3[index] = value;
+}
+
+[numthreads(8, 8, 1)]
+void K_RTToBufferFloat4(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _Width || id.y >= _Height)
+        return;
+
+    uint index = id.y * _Width + id.x;
+    float4 value = _InputTextureF4[int2(id.xy)];
+    _OutputBufferF4[index] = value;
+}
+
+[numthreads(8, 8, 1)]
+void K_BufferToRTFloat1(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _Width || id.y >= _Height)
+        return;
+
+    uint index = id.y * _Width + id.x;
+    float value = _InputBufferF1[index];
+    _OutputTextureF1[int2(id.xy)] = value;
+}
+
+[numthreads(8, 8, 1)]
+void K_BufferToRTFloat2(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _Width || id.y >= _Height)
+        return;
+
+    uint index = id.y * _Width + id.x;
+    float2 value = _InputBufferF2[index];
+    _OutputTextureF2[int2(id.xy)] = value;
+}
+
+[numthreads(8, 8, 1)]
+void K_BufferToRTFloat3(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _Width || id.y >= _Height)
+        return;
+
+    uint index = id.y * _Width + id.x;
+    float3 value = _InputBufferF3[index];
+    _OutputTextureF3[int2(id.xy)] = value;
+}
+
+[numthreads(8, 8, 1)]
+void K_BufferToRTFloat4(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _Width || id.y >= _Height)
+        return;
+
+    uint index = id.y * _Width + id.x;
+    float4 value = _InputBufferF4[index];
+    _OutputTextureF4[int2(id.xy)] = value;
+}
+

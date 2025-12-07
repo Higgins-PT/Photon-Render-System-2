@@ -1,0 +1,446 @@
+#include "UnityShaderVariables.cginc"
+#include "ReSTIRCommon.hlsl"
+#include "RayPayload.hlsl"
+
+#pragma max_recursion_depth 5
+
+#define PI 3.1415926535
+
+RaytracingAccelerationStructure g_SceneAccelStruct;
+
+RWTexture2D<float4> g_Output;
+
+RWStructuredBuffer<ReSTIRCandidate> g_ReSTIRCandidates;
+
+TextureCube<float4> g_EnvironmentMap;
+SamplerState samplerg_EnvironmentMap;
+
+cbuffer BrdfSettings
+{
+    float g_Zoom;
+    int   g_SamplesPerPixel;
+    int   g_MaxBounces;
+    int   g_EnableImportanceSampling;
+    uint  g_FrameIndex;
+    float g_Time;
+    float  g_SkyboxExposure;
+    float  g_SettingsPadding;
+    float3 g_MainLightColor;
+    float  g_MainLightEnabled;
+    float3 g_MainLightDirection;
+    float  g_MainLightAngularRadius;
+    int   g_MainLightTransparentIterations;
+    float  g_MainLightMultiplier;
+    float3 g_MainLightPadding;
+};
+
+float g_CameraNearPlane;
+float g_CameraFarPlane;
+
+float GetCameraNearPlaneSafe()
+{
+    return max(1.0e-4f, g_CameraNearPlane);
+}
+
+float GetCameraFarPlaneSafe()
+{
+    float nearPlane = GetCameraNearPlaneSafe();
+    return max(nearPlane + 1.0e-3f, g_CameraFarPlane);
+}
+
+StructuredBuffer<RayPayload> g_PrimaryRayPayloads;
+int g_PrimaryWidth;
+int g_PrimaryHeight;
+int g_WorkingWidth;
+int g_WorkingHeight;
+
+#include "ProbeSampling.hlsl"
+#include "BRDF.hlsl"
+
+
+
+[shader("miss")]
+void MainMissShader(inout RayPayload payload : SV_RayPayload)
+{
+    float3 dir = normalize(payload.rayDir);
+    float3 envColor = g_EnvironmentMap.SampleLevel(samplerg_EnvironmentMap, dir, 0).rgb * g_SkyboxExposure;
+    payload.baseColor = envColor;
+    payload.emission = envColor;
+    payload.hitPosition = 0;
+    payload.hitNormal = float3(0, 1, 0);
+    payload.hit = 0;
+    payload.throughput = 0;
+    payload.metallic = 0;
+    payload.anisotropy = 0;
+    payload.specularColor = float3(1, 1, 1);
+    payload.remainingDepth = 0;
+}
+
+[shader("raygeneration")]
+void MainRayGenShader()
+{
+    uint2 index = DispatchRaysIndex().xy;
+    uint2 dim   = DispatchRaysDimensions().xy;
+
+    uint workingWidth = g_WorkingWidth > 0 ? (uint)g_WorkingWidth : dim.x;
+    uint workingHeight = g_WorkingHeight > 0 ? (uint)g_WorkingHeight : dim.y;
+    uint primaryWidth = max(1u, g_PrimaryWidth > 0 ? (uint)g_PrimaryWidth : dim.x);
+    uint primaryHeight = max(1u, g_PrimaryHeight > 0 ? (uint)g_PrimaryHeight : dim.y);
+
+    float2 pixel = float2(index.x, index.y) + float2(0.5, 0.5);
+
+    float2 ndc = pixel / float2(dim.x - 1, dim.y - 1);
+    ndc = ndc * 2.0 - 1.0;
+
+    ndc *= g_Zoom;
+    float aspect = (float)dim.x / (float)dim.y;
+
+    float3 viewDir = normalize(float3(ndc.x * aspect, ndc.y, 1.0));
+
+    float3 worldDir = normalize(mul((float3x3)unity_CameraToWorld, viewDir));
+
+    RayDesc ray;
+    ray.Origin    = _WorldSpaceCameraPos;
+    ray.Direction = worldDir;
+    ray.TMin      = GetCameraNearPlaneSafe();
+    ray.TMax      = GetCameraFarPlaneSafe();
+
+    uint sampleCount = max(1, (uint)g_SamplesPerPixel);
+    uint maxBounces = max(1, (uint)g_MaxBounces);
+    uint secondaryBounceCount = maxBounces > 0 ? maxBounces - 1u : 0u;
+    float sunEnabled = g_MainLightEnabled;
+    float3 sunDirection = NormalizeSafe(g_MainLightDirection, float3(0, 1, 0));
+    float sunAngularRadius = max(g_MainLightAngularRadius, 0.0f);
+
+    float3 accumulatedRadiance = float3(0, 0, 0);
+    float firstHitDepthAccum = 0.0f;
+    float firstHitPdfAccum = 0.0f;
+    float firstHitCount = 0.0f;
+    float3 firstHitNormalAccum = float3(0, 0, 0);
+    float actualSampleCount = 0.0f;
+
+    float2 uv = ((float2)index + 0.5f) / float2((float)workingWidth, (float)workingHeight);
+    uint fullX = (uint)clamp(uv.x * (float)primaryWidth, 0.0f, (float)(primaryWidth - 1));
+    uint fullY = (uint)clamp(uv.y * (float)primaryHeight, 0.0f, (float)(primaryHeight - 1));
+    uint linearIndex = fullY * primaryWidth + fullX;
+    RayPayload primaryPayload = g_PrimaryRayPayloads[linearIndex];
+
+    int maxTransparentIterations = max(0, g_MainLightTransparentIterations);
+
+    if (primaryPayload.hit != 0)
+    {
+        float3 firstHitNormal = NormalizeSafe(primaryPayload.hitNormal, float3(0, 1, 0));
+        float3 firstHitPosition = primaryPayload.hitPosition;
+        float3 firstBaseColor = primaryPayload.baseColor;
+        float3 currentSpecularColor = saturate(primaryPayload.specularColor);
+        float firstDepth = length(firstHitPosition - _WorldSpaceCameraPos);
+        int baseMainLightState = primaryPayload.mainLight;
+
+        float sampleCountF = (float)sampleCount;
+        firstHitDepthAccum = firstDepth * sampleCountF;
+        firstHitNormalAccum = firstHitNormal * sampleCountF;
+        firstHitCount = sampleCountF;
+
+        for (uint sampleIndex = 0u; sampleIndex < sampleCount; ++sampleIndex)
+        {
+            float currentMetallic = saturate(primaryPayload.metallic);
+            float currentSmoothness = saturate(primaryPayload.smoothness);
+            float currentTransparency = saturate(primaryPayload.transparency);
+            float currentIor = primaryPayload.ior > 0.0f ? primaryPayload.ior : PHOTON_DEFAULT_IOR;
+            float currentAnisotropy = primaryPayload.anisotropy;
+            float3 currentBaseColor = firstBaseColor;
+            float3 incomingDir = NormalizeSafe(primaryPayload.rayDir, firstHitNormal);
+
+            actualSampleCount += 1.0f;
+            float3 viewVectorInitial = NormalizeSafe(-incomingDir, firstHitNormal);
+            float cosThetaInitial = saturate(dot(firstHitNormal, viewVectorInitial));
+            float3 fresnelInitial = FresnelSchlick(currentMetallic.xxx, cosThetaInitial);
+            float3 throughput = lerp(currentBaseColor, primaryPayload.specularColor, fresnelInitial);
+            float3 sampleRadiance = float3(0, 0, 0);
+            bool recordedFirstPdf = false;
+            float sampleFirstPdf = 1.0f;
+            int currentSurfaceMainLight = baseMainLightState;
+
+            float3 bounceNormal = firstHitNormal;
+            float3 bouncePosition = firstHitPosition;
+
+            uint rngSeedBase = Hash(
+                index.x * 1973u +
+                index.y * 9277u +
+                sampleIndex * 26699u +
+                g_FrameIndex * 374761393u);
+
+            if (sunEnabled > 0.5f)
+            {
+                float3 viewVector = NormalizeSafe(-incomingDir, bounceNormal);
+                float roughness = saturate(1.0f - currentSmoothness);
+                float ndotl = max(dot(bounceNormal, sunDirection), 0.0f);
+                if (ndotl > 0.0f)
+                {
+                    float3 coneDir = sunDirection;
+                    float coneNdot = ndotl;
+                    if (sunAngularRadius > 0.0f)
+                    {
+                        uint sunSeed = Hash(rngSeedBase + 7u);
+                        float2 sunXi = float2(
+                            RandomValue(sunSeed),
+                            RandomValue(sunSeed + 11u));
+                        coneDir = SampleCone(sunDirection, sunAngularRadius, sunXi);
+                        coneNdot = max(dot(bounceNormal, coneDir), 0.0f);
+                    }
+
+                    if (coneNdot > 0.0f)
+                    {
+                        RayDesc sunRay;
+                        sunRay.Origin = bouncePosition + bounceNormal * 0.01f;
+                        sunRay.Direction = coneDir;
+                        sunRay.TMin = 0;
+                        sunRay.TMax = GetCameraFarPlaneSafe();
+
+                        float sunTransmittance = 1.0f;
+                        int transparentCount = 0;
+                        bool reachedSun = false;
+
+                        [loop]
+                        while (true)
+                        {
+                            RayPayload shadowPayload;
+                            shadowPayload.baseColor = float3(0, 0, 0);
+                            shadowPayload.emission = float3(0, 0, 0);
+                            shadowPayload.throughput = float3(0, 0, 0);
+                            shadowPayload.hitPosition = sunRay.Origin;
+                            shadowPayload.hitNormal = bounceNormal;
+                            shadowPayload.rayDir = sunRay.Direction;
+                            shadowPayload.metallic = 0;
+                            shadowPayload.smoothness = 0;
+                            shadowPayload.anisotropy = 0;
+                            shadowPayload.transparency = 0;
+                            shadowPayload.ior = PHOTON_DEFAULT_IOR;
+                            shadowPayload.hit = 0;
+                            shadowPayload.mainLight = 0;
+                            shadowPayload.remainingDepth = 0;
+
+                            TraceRay(
+                                g_SceneAccelStruct,
+                                0,
+                                0xFF,
+                                0,
+                                1,
+                                0,
+                                sunRay,
+                                shadowPayload
+                            );
+
+                            if (shadowPayload.hit == 0)
+                            {
+                                reachedSun = true;
+                                break;
+                            }
+
+                            float surfaceTransparency = saturate(shadowPayload.transparency);
+                            sunTransmittance *= surfaceTransparency;
+
+                            if (sunTransmittance <= 1.0e-3f)
+                                break;
+
+                            if (transparentCount >= maxTransparentIterations)
+                                break;
+
+                            transparentCount++;
+                            float3 continueNormal = NormalizeSafe(shadowPayload.hitNormal, sunRay.Direction);
+                            float offsetSign = dot(continueNormal, sunRay.Direction) >= 0.0f ? 1.0f : -1.0f;
+                            sunRay.Origin = shadowPayload.hitPosition + continueNormal * (0.01f * offsetSign);
+                            sunRay.TMin = 0;
+                            sunRay.TMax = GetCameraFarPlaneSafe();
+                        }
+
+                        if (reachedSun)
+                        {
+                            float3 coneBrdf = CookTorranceBRDF(
+                                bounceNormal,
+                                viewVector,
+                                coneDir,
+                                currentBaseColor,
+                                currentMetallic,
+                                currentSpecularColor,
+                                roughness,
+                                currentAnisotropy);
+                            sampleRadiance += (coneBrdf * g_MainLightColor * (g_MainLightMultiplier * sunTransmittance));
+                        }
+                    }
+                }
+            }
+
+            for (uint bounce = 0u; bounce < secondaryBounceCount; ++bounce)
+            {
+                uint bounceSeed = Hash(rngSeedBase + bounce * 911u + 1u);
+                float3 sampleDir = bounceNormal;
+                float samplePdf = 1.0f;
+                bool usedProbeSampling = false;
+                bool usedTransmission = false;
+                float3 brdfWeight = float3(1.0f, 1.0f, 1.0f);
+                float roughness = saturate(1.0f - currentSmoothness);
+                float3 viewVector = NormalizeSafe(-incomingDir, bounceNormal);
+
+                if (!usedProbeSampling)
+                {
+                    float3 brdfDir;
+                    float3 brdfValue;
+                    float brdfPdf = 0.0f;
+                    bool transmitted = false;
+                    float4 randBrdf = float4(
+                        RandomValue(bounceSeed),
+                        RandomValue(bounceSeed + 1u),
+                        RandomValue(bounceSeed + 2u),
+                        RandomValue(bounceSeed + 3u));
+                    float2 randTransmission = float2(
+                        RandomValue(bounceSeed + 4u),
+                        RandomValue(bounceSeed + 5u));
+                    if (!SampleBRDF(
+                        bounceNormal,
+                        viewVector,
+                        currentBaseColor,
+                        currentMetallic,
+                        currentSpecularColor,
+                        roughness,
+                        currentAnisotropy,
+                        currentTransparency,
+                        currentIor,
+                        randBrdf,
+                        randTransmission,
+                        brdfDir,
+                        brdfValue,
+                        brdfPdf,
+                        transmitted))
+                    {
+                        break;
+                    }
+
+                    sampleDir = brdfDir;
+                    samplePdf = brdfPdf;
+                    brdfWeight = brdfValue;
+                    usedTransmission = transmitted;
+                }
+
+                float safePdf = max(samplePdf, 1.0e-4f);
+
+                if (!recordedFirstPdf)
+                {
+                    recordedFirstPdf = true;
+                    sampleFirstPdf = safePdf;
+                }
+
+                RayDesc secondaryRay;
+                float3 offsetNormal = bounceNormal;
+                if (usedTransmission)
+                {
+                    offsetNormal = dot(bounceNormal, sampleDir) >= 0.0f ? bounceNormal : -bounceNormal;
+                }
+                secondaryRay.Origin = bouncePosition + offsetNormal * 0.01f;
+                secondaryRay.Direction = sampleDir;
+                secondaryRay.TMin = 0;
+                secondaryRay.TMax = GetCameraFarPlaneSafe();
+
+
+
+                RayPayload payload;
+                payload.baseColor = float3(0, 0, 0);
+                payload.emission = float3(0, 0, 0);
+                payload.throughput = throughput;
+                payload.hitPosition = secondaryRay.Origin;
+                payload.hitNormal = bounceNormal;
+                payload.rayDir = secondaryRay.Direction;
+                payload.metallic = 0;
+                payload.anisotropy = 0;
+                payload.transparency = 0;
+                payload.ior = PHOTON_DEFAULT_IOR;
+                payload.hit = 0;
+                payload.mainLight = 0;
+                payload.remainingDepth = (int)(secondaryBounceCount - bounce);
+                TraceRay(
+                    g_SceneAccelStruct,
+                    0,
+                    0xFF,
+                    0,
+                    1,
+                    0,
+                    secondaryRay,
+                    payload
+                );
+                throughput *= saturate((brdfWeight) / safePdf);
+                if (payload.hit == 0)
+                {
+                    sampleRadiance += throughput * payload.baseColor;
+                    break;
+                }
+
+                sampleRadiance += throughput * payload.emission;
+                
+                currentBaseColor = payload.baseColor;
+                currentSpecularColor = payload.specularColor;
+                currentSurfaceMainLight = payload.mainLight;
+                
+                currentAnisotropy = payload.anisotropy;
+                    
+                bounceNormal = NormalizeSafe(payload.hitNormal, float3(0, 1, 0));
+                bouncePosition = payload.hitPosition;
+                currentMetallic = saturate(payload.metallic);
+                currentSmoothness = saturate(payload.smoothness);
+                currentTransparency = saturate(payload.transparency);
+                currentIor = payload.ior > 0.0f ? payload.ior : PHOTON_DEFAULT_IOR;
+                incomingDir = NormalizeSafe(payload.rayDir, bounceNormal);
+                if (sunEnabled > 0.5f && currentSurfaceMainLight != 0)
+                {
+                    float3 surfaceView = NormalizeSafe(-sampleDir, bounceNormal);
+                    float roughnessSurface = saturate(1.0f - currentSmoothness);
+                    float ndotlSun = max(dot(bounceNormal, sunDirection), 0.0f);
+                    if (ndotlSun > 0.0f)
+                    {
+                        float3 sunBrdf = CookTorranceBRDF(
+                            bounceNormal,
+                            surfaceView,
+                            sunDirection,
+                            currentBaseColor,
+                            currentMetallic,
+                            currentSpecularColor,
+                            roughnessSurface    ,
+                            currentAnisotropy);
+                        sampleRadiance += throughput * (sunBrdf * g_MainLightColor * g_MainLightMultiplier);
+                    }
+                }
+            }
+
+            accumulatedRadiance += sampleRadiance;
+
+            if (recordedFirstPdf)
+            {
+                firstHitPdfAccum += sampleFirstPdf;
+            }
+        }
+    }
+    float denominator = actualSampleCount > 0.0f ? actualSampleCount : 1.0f;
+    float3 finalRadiance = accumulatedRadiance / denominator;
+    float depthAverage = firstHitCount > 0.0f ? firstHitDepthAccum / firstHitCount : 1.0e9f;
+    float pdfAverage = firstHitCount > 0.0f ? firstHitPdfAccum / firstHitCount : 1.0f;
+    float3 normalAverage = firstHitCount > 0.0f
+        ? NormalizeSafe(firstHitNormalAccum / firstHitCount, float3(0, 1, 0))
+        : float3(0, 1, 0);
+
+    float safePdf = max(pdfAverage, 1.0e-4f);
+    float candidateWeight = ComputeCandidateWeight(finalRadiance, 1); 
+    ReSTIRCandidate candidate;
+    candidate.radiance = finalRadiance;
+    candidate.weight = candidateWeight;
+    candidate.depth = depthAverage;
+    candidate.normal = normalAverage;
+    candidate.pdf = 1;
+    candidate.padding0 = 0.0f;
+    candidate.padding1 = float2(0, 0);
+
+    uint clampedX = min(index.x, workingWidth - 1u);
+    uint clampedY = min(index.y, workingHeight - 1u);
+    uint workingIndex = clampedY * workingWidth + clampedX;
+    g_ReSTIRCandidates[workingIndex] = candidate;
+    g_Output[index] = float4(finalRadiance, 1);
+}
+

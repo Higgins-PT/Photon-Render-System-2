@@ -1,0 +1,285 @@
+#include "UnityShaderVariables.cginc"
+#include "SH_Lite.hlsl"
+
+#pragma max_recursion_depth 5
+
+struct ProbePosition
+{
+    float3 position;
+    float padding;
+};
+
+RaytracingAccelerationStructure g_SceneAccelStruct;
+
+StructuredBuffer<ProbePosition> g_ProbePositions;
+RWStructuredBuffer<L2> g_ProbeSHCoefficients;
+
+TextureCube<float4> g_EnvironmentMap;
+SamplerState samplerg_EnvironmentMap;
+
+cbuffer ProbeBakeSettings
+{
+    uint g_ProbeCount;
+    uint g_SamplesPerProbe;
+    uint g_MaxBounces;
+    uint g_BaseSeed;
+    float g_RayBias;
+    float g_MaxRayDistance;
+    float g_MinRadianceWeight;
+    float3 g_ProbeBakePadding;
+};
+
+float g_CameraNearPlane;
+float g_CameraFarPlane;
+
+float GetProbeRayNear()
+{
+    return max(g_RayBias, g_CameraNearPlane);
+}
+
+float GetProbeRayFar()
+{
+    float nearValue = GetProbeRayNear();
+    float farValue = g_CameraFarPlane > 0.0f ? min(g_MaxRayDistance, g_CameraFarPlane) : g_MaxRayDistance;
+    if (farValue <= nearValue + 1.0e-3f)
+    {
+        farValue = nearValue + 1.0f;
+    }
+    return farValue;
+}
+
+static const float PI = 3.14159265f;
+static const float TWO_PI = 6.28318530f;
+static const float GOLDEN_RATIO = 1.61803398875f;
+
+static const uint PDF_INTEGRAL_SAMPLE_COUNT = 512u;
+
+struct RayPayload
+{
+    float3 baseColor;
+    float3 emission;
+    float3 throughput;
+    float3 hitPosition;
+    float3 hitNormal;
+    float3 rayDir;
+    float3 specularColor;
+    float  metallic;
+    float  smoothness;
+    float  anisotropy;
+    float  transparency;
+    float  ior;
+    int    hit;
+    int    mainLight;
+    int    remainingDepth;
+};
+
+uint Hash(uint state)
+{
+    state ^= 2747636419u;
+    state *= 2654435769u;
+    state ^= state >> 16;
+    state *= 2654435769u;
+    state ^= state >> 16;
+    state *= 2654435769u;
+    return state;
+}
+
+float RandomValue(uint state)
+{
+    return (Hash(state) & 0x00FFFFFFu) / 16777215.0f;
+}
+
+float2 RandomFloat2(uint seed)
+{
+    return float2(RandomValue(seed), RandomValue(seed + 1u));
+}
+
+float3 CosineSampleHemisphere(float2 xi)
+{
+    float r = sqrt(xi.x);
+    float phi = TWO_PI * xi.y;
+    float x = r * cos(phi);
+    float y = r * sin(phi);
+    float z = sqrt(max(0.0f, 1.0f - xi.x));
+    return float3(x, y, z);
+}
+
+float3 TangentToWorld(float3 localDir, float3 normal)
+{
+    float3 up = abs(normal.y) < 0.999f ? float3(0, 1, 0) : float3(1, 0, 0);
+    float3 tangent = normalize(cross(up, normal));
+    float3 bitangent = cross(normal, tangent);
+    return localDir.x * tangent + localDir.y * bitangent + localDir.z * normal;
+}
+
+float3 SampleSphere(float2 xi)
+{
+    float z = 1.0f - 2.0f * xi.x;
+    float r = sqrt(max(0.0f, 1.0f - z * z));
+    float phi = TWO_PI * xi.y;
+    float x = r * cos(phi);
+    float y = r * sin(phi);
+    return float3(x, y, z);
+}
+
+float ComputeRadianceValue(float3 color)
+{
+    return dot(color, float3(0.2126f, 0.7152f, 0.0722f));
+}
+
+float3 FibonacciDirection(uint index, uint sampleCount)
+{
+    float fi = ((float)index + 0.5f) / (float)sampleCount;
+    float phi = TWO_PI * (float)index / GOLDEN_RATIO;
+    float z = 1.0f - 2.0f * fi;
+    float r = sqrt(max(0.0f, 1.0f - z * z));
+    float x = cos(phi) * r;
+    float y = sin(phi) * r;
+    return float3(x, y, z);
+}
+
+float EstimatePositiveIntegral(L2 sh, uint sampleCount)
+{
+    if (sampleCount == 0u)
+        sampleCount = 1u;
+
+    float sum = 0.0f;
+    for (uint i = 0u; i < sampleCount; ++i)
+    {
+        float3 dir = FibonacciDirection(i, sampleCount);
+        float value = Evaluate(sh, dir);
+        sum += max(0.0f, value);
+    }
+
+    float average = sum / (float)sampleCount;
+    return average * (4.0f * PI);
+}
+
+float3 EstimateRadiance(float3 origin, float3 direction, uint seed)
+{
+    RayDesc ray;
+    ray.Origin = origin;
+    ray.Direction = direction;
+    ray.TMin = GetProbeRayNear();
+    ray.TMax = GetProbeRayFar();
+
+    float3 throughput = float3(1, 1, 1);
+    float3 sampleRadiance = float3(0, 0, 0);
+    uint maxBounces = max(1u, g_MaxBounces);
+
+    for (uint bounce = 0u; bounce < maxBounces; ++bounce)
+    {
+        RayPayload payload;
+        payload.baseColor = float3(0, 0, 0);
+        payload.emission = float3(0, 0, 0);
+        payload.throughput = throughput;
+        payload.hitPosition = ray.Origin;
+        payload.hitNormal = ray.Direction;
+        payload.rayDir = ray.Direction;
+        payload.metallic = 0;
+        payload.smoothness = 0;
+        payload.anisotropy = 0;
+        payload.specularColor = float3(1, 1, 1);
+        payload.hit = 0;
+        payload.remainingDepth = (int)(maxBounces - bounce);
+
+        TraceRay(
+            g_SceneAccelStruct,
+            0,
+            0xFF,
+            0,
+            1,
+            0,
+            ray,
+            payload
+        );
+
+        if (payload.hit == 0)
+        {
+            sampleRadiance += throughput * payload.baseColor;
+            break;
+        }
+
+        sampleRadiance += throughput * payload.emission;
+        throughput *= payload.baseColor;
+
+        if (bounce + 1u >= maxBounces)
+            break;
+
+        float3 hitNormal = normalize(payload.hitNormal);
+        float3 originOffset = payload.hitPosition + hitNormal * g_RayBias;
+
+        uint bounceSeed = Hash(seed + bounce * 911u + 1u);
+        float2 bounceXi = RandomFloat2(bounceSeed);
+        float3 localDir = CosineSampleHemisphere(bounceXi);
+        float3 newDir = TangentToWorld(localDir, hitNormal);
+
+        ray.Origin = originOffset;
+        ray.Direction = newDir;
+        ray.TMin = GetProbeRayNear();
+        ray.TMax = GetProbeRayFar();
+    }
+
+    return sampleRadiance;
+}
+
+[shader("miss")]
+void ProbeBakeMissShader(inout RayPayload payload : SV_RayPayload)
+{
+    float3 dir = normalize(payload.rayDir);
+    float3 envColor = g_EnvironmentMap.SampleLevel(samplerg_EnvironmentMap, dir, 0).rgb;
+    payload.baseColor = envColor;
+    payload.emission = envColor;
+    payload.hitPosition = 0;
+    payload.hitNormal = float3(0, 1, 0);
+    payload.hit = 0;
+    payload.throughput = 0;
+    payload.metallic = 0;
+    payload.smoothness = 0;
+    payload.anisotropy = 0;
+    payload.specularColor = float3(1, 1, 1);
+    payload.remainingDepth = 0;
+}
+
+[shader("raygeneration")]
+void MainRayGenShader()
+{
+    uint probeIndex = DispatchRaysIndex().x;
+    if (probeIndex >= g_ProbeCount)
+        return;
+
+    ProbePosition probe = g_ProbePositions[probeIndex];
+    L2 shAccum = L2::Zero();
+
+    uint sampleCount = max(1u, g_SamplesPerProbe);
+
+    for (uint sample = 0u; sample < sampleCount; ++sample)
+    {
+        uint seed = Hash(probeIndex * 9781u + sample * 26699u + g_BaseSeed);
+        float2 xi = RandomFloat2(seed);
+        float3 sampleDir = SampleSphere(xi);
+
+        float3 radiance = EstimateRadiance(probe.position, sampleDir, seed + 17u);
+        float radianceValue = ComputeRadianceValue(radiance);
+
+        float minWeight = max(0.0f, g_MinRadianceWeight);
+        L2 projected = ProjectOntoL2(sampleDir, max(radianceValue, minWeight));
+        shAccum = Add(shAccum, projected);
+    }
+
+    float weight = (4.0f * PI) / sampleCount;
+    shAccum = Multiply(shAccum, weight);
+
+    float integral = EstimatePositiveIntegral(shAccum, PDF_INTEGRAL_SAMPLE_COUNT);
+    if (integral > 0.0f)
+    {
+        float normalization = 1.0f / integral;
+        shAccum = Multiply(shAccum, normalization);
+    }
+    else
+    {
+        shAccum = L2::Zero();
+    }
+    g_ProbeSHCoefficients[probeIndex] = shAccum;
+}
+

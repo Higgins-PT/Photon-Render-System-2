@@ -1,0 +1,168 @@
+#pragma kernel TemporalAccumulation
+#pragma kernel AtrousFilter
+
+Texture2D<float4> g_CurrentColor;
+Texture2D<float4> g_PreviousColor;
+Texture2D<float2> g_MotionVectorTexture;
+Texture2D<float4> g_NormalTexture;
+Texture2D<float> g_DepthTexture;
+RWTexture2D<float4> g_TemporalOutput;
+
+Texture2D<float4> g_TemporalColor;
+RWTexture2D<float4> g_DenoisedOutput;
+Texture2D<float4> g_PreviousNormalTexture;
+Texture2D<float>  g_PreviousDepthTexture;
+
+SamplerState samplerLinearClamp;
+
+cbuffer SvgfSettings
+{
+    uint  g_Width;
+    uint  g_Height;
+    float g_TemporalAlpha;
+    float g_DepthSigma;
+    float g_NormalSigma;
+    uint  g_HasHistory;
+    uint  g_HasMotionVectors;
+    uint  g_HasNormals;
+    uint  g_HasDepth;
+    uint  g_AtrousIteration;
+    uint  g_HasHistoryNormals;
+    uint  g_HasHistoryDepthTex;
+    uint  g_EnableHistoryClamp;
+    float g_NormalHistoryThreshold;
+    float g_WorldPosHistoryThreshold;
+};
+
+cbuffer SvgfMatrices
+{
+    float4x4 g_CurrInvViewProj;
+    float4x4 g_PrevInvViewProj;
+};
+
+float3 ReconstructWorldPosition(float2 uv, float depth, float4x4 invViewProj)
+{
+    float2 ndc = float2(uv.x * 2.0f - 1.0f, uv.y * 2.0f - 1.0f);
+    float z = depth * 2.0f - 1.0f;
+    float4 clip = float4(ndc, z, 1.0f);
+    float4 world = mul(invViewProj, clip);
+    return world.xyz / max(world.w, 1.0e-4f);
+}
+
+[numthreads(8, 8, 1)]
+void TemporalAccumulation(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= g_Width || id.y >= g_Height)
+        return;
+
+    float3 currentColor = g_CurrentColor.Load(int3(id.xy, 0)).rgb;
+    float3 historyColor = currentColor;
+    bool historyValid = (g_HasHistory != 0);
+    float2 uv = (float2(id.xy) + 0.5f) / float2((float)g_Width, (float)g_Height);
+    float3 currNormal = g_HasNormals != 0 ? normalize(g_NormalTexture.Load(int3(id.xy, 0)).xyz) : float3(0, 1, 0);
+    float currDepth = g_HasDepth != 0 ? g_DepthTexture.Load(int3(id.xy, 0)) : 0.0f;
+
+    if (historyValid)
+    {
+        float2 prevUV = uv;
+        int2 prevPixel = int2(id.xy);
+
+        if (g_HasMotionVectors != 0)
+        {
+            float2 motion = g_MotionVectorTexture.SampleLevel(samplerLinearClamp, uv, 0).xy;
+            prevUV = uv - motion;
+            if (all(prevUV >= 0.0f) && all(prevUV <= 1.0f))
+            {
+                prevPixel = int2(prevUV * float2((float)g_Width, (float)g_Height));
+                prevPixel = clamp(prevPixel, int2(0, 0), int2((int)g_Width - 1, (int)g_Height - 1));
+            }
+            else
+            {
+                historyValid = false;
+            }
+        }
+
+        if (historyValid)
+        {
+            historyColor = g_PreviousColor.SampleLevel(samplerLinearClamp, prevUV, 0).rgb;
+
+            if (g_EnableHistoryClamp != 0 && g_HasDepth != 0 && g_HasHistoryDepthTex != 0)
+            {
+                float prevDepth = g_PreviousDepthTexture.SampleLevel(samplerLinearClamp, prevUV, 0);
+                float3 prevNormal = (g_HasHistoryNormals != 0)
+                    ? normalize(g_PreviousNormalTexture.SampleLevel(samplerLinearClamp, prevUV, 0).xyz)
+                    : currNormal;
+
+                float3 currWorld = ReconstructWorldPosition(uv, currDepth, g_CurrInvViewProj);
+                float3 prevWorld = ReconstructWorldPosition(prevUV, prevDepth, g_PrevInvViewProj);
+
+                float worldDelta = length(currWorld - prevWorld);
+                float normalDot = dot(currNormal, prevNormal);
+
+                if (worldDelta > g_WorldPosHistoryThreshold || normalDot < g_NormalHistoryThreshold)
+                {
+                    historyValid = false;
+                }
+            }
+        }
+    }
+
+    float alpha = historyValid ? g_TemporalAlpha : 1.0f;
+    float3 accumulated = lerp(historyColor, currentColor, alpha);
+    g_TemporalOutput[id.xy] = float4(accumulated, 1.0f);
+}
+
+static const int2 kFilterOffsets[8] = {
+    int2(1, 0),
+    int2(-1, 0),
+    int2(0, 1),
+    int2(0, -1),
+    int2(1, 1),
+    int2(-1, 1),
+    int2(-1, -1),
+    int2(1, -1)
+};
+
+[numthreads(8, 8, 1)]
+void AtrousFilter(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= g_Width || id.y >= g_Height)
+        return;
+
+    int2 pixel = int2(id.xy);
+    int stepSize = 1 << g_AtrousIteration;
+
+    float3 centerColor = g_TemporalColor.Load(int3(pixel, 0)).rgb;
+    float centerDepth = g_HasDepth != 0 ? g_DepthTexture.Load(int3(pixel, 0)) : 0.0f;
+    float3 centerNormal = g_HasNormals != 0 ? normalize(g_NormalTexture.Load(int3(pixel, 0)).xyz) : float3(0, 1, 0);
+
+    float3 sum = centerColor;
+    float totalWeight = 1.0f;
+
+    for (int i = 0; i < 8; ++i)
+    {
+        int2 coord = clamp(pixel + kFilterOffsets[i] * stepSize, int2(0, 0), int2((int)g_Width - 1, (int)g_Height - 1));
+        float3 sampleColor = g_TemporalColor.Load(int3(coord, 0)).rgb;
+
+        float weight = 1.0f;
+        if (g_HasDepth != 0)
+        {
+            float sampleDepth = g_DepthTexture.Load(int3(coord, 0));
+            weight *= exp(-abs(sampleDepth - centerDepth) * g_DepthSigma);
+        }
+
+        if (g_HasNormals != 0)
+        {
+            float3 sampleNormal = normalize(g_NormalTexture.Load(int3(coord, 0)).xyz);
+            weight *= pow(max(dot(sampleNormal, centerNormal), 0.0f), g_NormalSigma);
+        }
+
+        sum += sampleColor * weight;
+        totalWeight += weight;
+    }
+
+    float3 filtered = sum / max(totalWeight, 1.0e-4f);
+    g_DenoisedOutput[pixel] = float4(filtered, 1.0f);
+}
+
+

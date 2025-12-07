@@ -1,0 +1,219 @@
+#pragma kernel TemporalResample
+#pragma kernel SpatialResample
+
+#include "ReSTIRCommon.hlsl"
+
+StructuredBuffer<ReSTIRCandidate> g_ReSTIRCandidates;
+RWStructuredBuffer<ReSTIRReservoir> g_ReSTIRHistory;
+RWStructuredBuffer<ReSTIRReservoir> g_ReSTIRTemporal;
+RWTexture2D<float4> g_Output;
+
+Texture2D<float2> g_MotionVectorTexture;
+SamplerState samplerLinearClamp;
+
+cbuffer ReSTIRTemporalSettings
+{
+    uint  g_ImageWidth;
+    uint  g_ImageHeight;
+    uint  g_FrameIndex;
+    uint  g_TemporalEnabled;
+    float g_TemporalDepthThreshold;
+    float g_TemporalNormalThreshold;
+    float g_TemporalWeightBoost;
+    uint  g_TemporalHasMotionVectors;
+};
+
+cbuffer ReSTIRSpatialSettings
+{
+    uint  g_SpatialImageWidth;
+    uint  g_SpatialImageHeight;
+    uint  g_SpatialFrameIndex;
+    uint  g_SpatialEnabled;
+    int   g_SpatialRadius;
+    float g_SpatialDepthThreshold;
+    float g_SpatialNormalThreshold;
+};
+
+[numthreads(8, 8, 1)]
+void TemporalResample(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= g_ImageWidth || id.y >= g_ImageHeight)
+        return;
+
+    uint index = id.y * g_ImageWidth + id.x;
+    bool temporalEnabled = (g_TemporalEnabled != 0);
+
+    ReSTIRCandidate candidate = g_ReSTIRCandidates[index];
+    candidate.normal = NormalizeSafe(candidate.normal, float3(0, 1, 0));
+    candidate.pdf = max(candidate.pdf, 1.0e-4f);
+    candidate.weight = max(candidate.weight, 0.0f);
+
+    ReSTIRReservoir candidateReservoir = CreateReservoirFromCandidate(candidate);
+
+    uint historyIndex = index;
+    bool motionAvailable = temporalEnabled && (g_TemporalHasMotionVectors != 0);
+
+    if (motionAvailable)
+    {
+        float2 uv = (float2(id.xy) + 0.5f) / float2((float)g_ImageWidth, (float)g_ImageHeight);
+        float2 motion = g_MotionVectorTexture.SampleLevel(samplerLinearClamp, uv, 0).xy;
+        float2 prevUV = uv - motion;
+        if (all(prevUV >= 0.0f) && all(prevUV <= 1.0f))
+        {
+            uint prevX = (uint)clamp(prevUV.x * (float)g_ImageWidth, 0.0f, (float)(g_ImageWidth - 1));
+            uint prevY = (uint)clamp(prevUV.y * (float)g_ImageHeight, 0.0f, (float)(g_ImageHeight - 1));
+            historyIndex = prevY * g_ImageWidth + prevX;
+        }
+        else
+        {
+            motionAvailable = false;
+        }
+    }
+
+    ReSTIRReservoir history = g_ReSTIRHistory[historyIndex];
+    history.normal = NormalizeSafe(history.normal, float3(0, 1, 0));
+
+    bool historyValid = temporalEnabled && history.weightSum > 0.0f;
+    if (temporalEnabled && g_TemporalHasMotionVectors != 0 && !motionAvailable)
+    {
+        historyValid = false;
+    }
+    if (historyValid)
+    {
+        float depthDiff = abs(history.depth - candidateReservoir.depth);
+        float normalDot = dot(history.normal, candidateReservoir.normal);
+        if (depthDiff > g_TemporalDepthThreshold || normalDot < g_TemporalNormalThreshold)
+        {
+            historyValid = false;
+        }
+    }
+
+    ReSTIRReservoir result;
+    if (!historyValid)
+    {
+        result = candidateReservoir;
+    }
+    else
+    {
+        if (temporalEnabled)
+        {
+            float targetM = 20.0f * max(1.0f, (float)candidateReservoir.m);
+            if ((float)history.m > targetM)
+            {
+                float scale = targetM / max(1.0f, (float)history.m);
+                history.weightSum *= scale;
+                history.m = (uint)targetM;
+            }
+
+            result = history;
+            float candidateWeight = candidateReservoir.weightSum * g_TemporalWeightBoost;
+            MergeReservoirWithCandidate(
+                result,
+                candidateReservoir,
+                candidateWeight,
+                Hash(index + g_FrameIndex * 1664525u));
+        }
+        else
+        {
+            result = candidateReservoir;
+        }
+    }
+
+    result.weightSum = max(result.weightSum, 0.0f);
+    g_ReSTIRTemporal[index] = result;
+    g_ReSTIRHistory[index] = result;
+
+    float safeWeight = max(result.weight, 1.0e-5f);
+    float mValue = max(1.0f, (float)result.m);
+    float weightFactor = (1.0f / safeWeight) * (result.weightSum / mValue);
+    float3 debugColor = result.radiance * weightFactor;
+    g_Output[int2(id.xy)] = float4(debugColor, 1.0f);
+}
+
+static const int2 kSpatialOffsets[8] = {
+    int2(1, 0),
+    int2(-1, 0),
+    int2(0, 1),
+    int2(0, -1),
+    int2(1, 1),
+    int2(-1, 1),
+    int2(-1, -1),
+    int2(1, -1)
+};
+
+static const float kSpatialJacobianClamp = 32.0f;
+
+float ComputeSpatialJacobianFactor(ReSTIRReservoir target, ReSTIRReservoir source)
+{
+    float targetDepth = max(target.depth, 1.0e-3f);
+    float sourceDepth = max(source.depth, 1.0e-3f);
+    float depthRatio = (sourceDepth * sourceDepth) / max(targetDepth * targetDepth, 1.0e-6f);
+
+    float normalRatio = max(dot(target.normal, source.normal), 0.0f);
+    float jacobian = depthRatio * normalRatio;
+    return clamp(jacobian, 0.0f, kSpatialJacobianClamp);
+}
+
+[numthreads(8, 8, 1)]
+void SpatialResample(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= g_SpatialImageWidth || id.y >= g_SpatialImageHeight)
+        return;
+
+    uint index = id.y * g_SpatialImageWidth + id.x;
+    bool spatialEnabled = (g_SpatialEnabled != 0);
+    ReSTIRReservoir reservoir = g_ReSTIRTemporal[index];
+    reservoir.normal = NormalizeSafe(reservoir.normal, float3(0, 1, 0));
+
+    if (reservoir.weightSum <= 0.0f)
+    {
+        g_ReSTIRHistory[index] = reservoir;
+        g_Output[int2(id.xy)] = float4(0, 0, 0, 1);
+        return;
+    }
+
+    int radius = max(1, g_SpatialRadius);
+
+    if (spatialEnabled)
+    {
+        for (int i = 0; i < 8; ++i)
+        {
+            int2 offset = kSpatialOffsets[i] * radius;
+
+            int2 current = int2(id.xy) + offset;
+            current = clamp(current, int2(0, 0), int2((int)g_SpatialImageWidth - 1, (int)g_SpatialImageHeight - 1));
+
+            uint neighborIndex = current.y * g_SpatialImageWidth + current.x;
+            if (neighborIndex == index)
+                continue;
+
+            ReSTIRReservoir neighbor = g_ReSTIRTemporal[neighborIndex];
+            neighbor.normal = NormalizeSafe(neighbor.normal, float3(0, 1, 0));
+
+            if (neighbor.weightSum <= 0.0f)
+                continue;
+
+            if (!ReservoirsCompatible(reservoir, neighbor, g_SpatialDepthThreshold, g_SpatialNormalThreshold))
+                continue;
+
+            float jacobian = ComputeSpatialJacobianFactor(reservoir, neighbor);
+            if (jacobian <= 1.0e-4f)
+                continue;
+
+            neighbor.weight = max(neighbor.weight, 0.0f) * jacobian;
+            neighbor.weightSum = max(neighbor.weightSum, 0.0f) * jacobian;
+
+            uint seed = Hash(index + i * 15731u + g_SpatialFrameIndex * 26641u);
+            MergeReservoirWithCandidate(reservoir, neighbor, neighbor.weightSum, seed + 1u);
+        }
+    }
+
+    reservoir.weightSum = max(reservoir.weightSum, 1.0e-6f);
+
+    float safeWeight = max(reservoir.weight, 1.0e-5f);
+    float weightFactor = (1 / safeWeight) * (reservoir.weightSum / (float)reservoir.m) ;
+    float3 color = reservoir.radiance * weightFactor;
+    g_Output[int2(id.xy)] = float4(color, 1.0f);
+}
+
+
