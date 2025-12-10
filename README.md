@@ -15,7 +15,9 @@ Photon Render System 2 is a comprehensive ray tracing solution that provides rea
 <img width="2184" height="1215" alt="2dbadc86-16e0-486f-830a-bcb133870f55" src="https://github.com/user-attachments/assets/d162c06e-a654-4e98-b55d-1996a88507ab" />
 <img width="2208" height="1228" alt="6f06d85c14126103bd31d45a040900a5" src="https://github.com/user-attachments/assets/667a4f71-e342-462d-9130-64f4812635c9" />
 <img width="2205" height="1228" alt="ec1c4f3fc14f4baca46f8ad76fae91a7" src="https://github.com/user-attachments/assets/7fb0cefc-fc8d-4369-b93d-0deeef2cb399" />
-![Uploading 249f4d2ca67e87ebc3eb831f4910ee0c.png…]()
+<img width="2212" height="1232" alt="1c8c8f7dc8943bcb8e583e572f57efa9" src="https://github.com/user-attachments/assets/59fbeb86-82df-4386-b394-49ee288b905e" />
+<img width="2201" height="1226" alt="249f4d2ca67e87ebc3eb831f4910ee0c" src="https://github.com/user-attachments/assets/ffd64854-e4d7-4521-ade6-2f3caabbe2ab" />
+
 
 ## Features
 
